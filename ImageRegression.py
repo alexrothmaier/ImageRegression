@@ -1,7 +1,7 @@
 from datasets import load_dataset, DatasetDict
 from PIL import Image
 import torch
-from torchvision import transforms
+from torchvision import transforms, models
 from transformers import ViTModel, TrainingArguments, Trainer
 from torch import nn
 from torch.utils.data import DataLoader
@@ -11,6 +11,9 @@ import logging
 import os
 import json
 import shutil
+import time
+import wandb
+from tqdm import tqdm
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -26,18 +29,54 @@ class ViTRegressionModel(nn.Module):
     def forward(self, pixel_values, labels=None):
         outputs = self.vit(pixel_values=pixel_values)
         cls_output = outputs.last_hidden_state[:, 0, :]  # Take the [CLS] token
-        values = self.classifier(cls_output)
+        raw_values = self.classifier(cls_output)
+        # Apply sigmoid activation and scale to 0-100 range
+        values = torch.sigmoid(raw_values) * 100
+        #values = self.classifier(cls_output)
         loss = None
         if labels is not None:
             loss_fct = nn.MSELoss()
             loss = loss_fct(values.view(-1), labels.view(-1))
         return (loss, values) if loss is not None else values
+    
+
+class CNNRegressionModel(nn.Module):
+    def __init__(self):
+        super(CNNRegressionModel, self).__init__()
+        # Load a pretrained ResNet model
+        self.resnet = models.resnet50(pretrained=True)
+        
+        # Replace the final fully connected layer with a regression head
+        # The original fully connected layer has 2048 input features
+        self.resnet.fc = nn.Linear(self.resnet.fc.in_features, 1)
+
+    def forward(self, pixel_values, labels=None):
+        # Pass the input through the ResNet model
+        raw_values = self.resnet(pixel_values)
+        
+        # Apply sigmoid activation and scale to 0-100 range
+        values = torch.sigmoid(raw_values) * 100
+        
+        loss = None
+        if labels is not None:
+            loss_fct = nn.MSELoss()
+            loss = loss_fct(values.view(-1), labels.view(-1))
+        
+        return (loss, values) if loss is not None else values
 
 
 
-def train_model(dataset_id, value_column_name, test_split, output_dir, name, num_train_epochs, learning_rate):
+def train_model(dataset_id, value_column_name, test_split, output_dir, name, num_train_epochs, learning_rate, model='vit'):
+
+    
     # Load the dataset
     dataset = load_dataset(dataset_id)
+
+    #remove rows with nan values
+    dataset['train'] = dataset['train'].filter(lambda example: example[value_column_name] is not None)
+
+    #subsample 10 examples
+    dataset['train'] = dataset['train'].select(range(10))
 
     # Split the dataset into train and test
     train_test_split = dataset['train'].train_test_split(test_size=test_split)
@@ -55,8 +94,11 @@ def train_model(dataset_id, value_column_name, test_split, output_dir, name, num
     # Get max value
     train_values = dataset['train'][value_column_name]
     test_values = dataset['test'][value_column_name]
+    min_value = min(train_values + test_values)
     max_value = max(train_values + test_values)
+    print('Min Value:', min_value)
     print('Max Value:', max_value)
+
 
 
     def preprocess(example):
@@ -75,11 +117,12 @@ def train_model(dataset_id, value_column_name, test_split, output_dir, name, num
         return {'pixel_values': pixel_values, 'labels': labels}
 
 
-    model = ViTRegressionModel()
+    model = ViTRegressionModel() if model == 'vit' else CNNRegressionModel()
 
     training_args = TrainingArguments(
         output_dir=output_dir,
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
+        save_strategy="epoch",
         per_device_train_batch_size=8,
         per_device_eval_batch_size=8,
         num_train_epochs=num_train_epochs,
@@ -89,6 +132,9 @@ def train_model(dataset_id, value_column_name, test_split, output_dir, name, num
         logging_steps=10,
         remove_unused_columns=False,
         resume_from_checkpoint=True,
+        load_best_model_at_end=True,
+        report_to="wandb",
+        run_name=name
     )
 
     train_dataloader = DataLoader(dataset['train'], batch_size=8, shuffle=True, collate_fn=collate_fn)
@@ -106,16 +152,26 @@ def train_model(dataset_id, value_column_name, test_split, output_dir, name, num
     def compute_metrics(p):
         preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
         labels = p.label_ids
-        logger.info(f"Predictions: {preds[:5]}")
-        logger.info(f"Labels: {labels[:5]}")
+        #logger.info(f"Predictions: {preds[:5]}")
+        #logger.info(f"Labels: {labels[:5]}")
         mse = ((preds - labels) ** 2).mean().item()
+
+        # images = dataset['test'][:5] 
+        # wandb.log({
+        # "predictions": [wandb.Image(image, caption=f"Pred: {pred}, Label: {label}") 
+        #                 for image, pred, label in zip(images, preds[:5], labels[:5])]
+        # })
+        
         return {"mse": mse}
 
     trainer.compute_metrics = compute_metrics
 
     trainer.train()
     eval_results = trainer.evaluate()
-    print(f"Evaluation results: {eval_results}")
+    #print(f"Evaluation results: {eval_results}")
+
+
+    
 
     # Write jSON file
     data = {
@@ -141,9 +197,25 @@ def train_model(dataset_id, value_column_name, test_split, output_dir, name, num
                 print(f'Data successfully written to {file_path}')
 
 
+    # load test dataset 
+    # test_dataset = load_dataset('alexrothmaier/train_final', split='train')
+    # test_dataset = test_dataset.select(range(10))
+    # value_column_name = 'fill_level_ranseg'
+    # max_value = max(test_dataset[value_column_name])
+    # test_dataset = test_dataset.map(preprocess, batched=False)
+    # test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
+
+    # trainer.eval_dataset = test_dataset
+    # test_results = trainer.evaluate()
+    # print(f"Test results: {test_results}")
+    wandb.finish()
+
+    return model, max_value
+
+
 def upload_model(model_id, token, checkpoint_dir):
     # Create a new repo
-    repo_url = create_repo(model_id, token=token, repo_type='model')
+    repo_url = create_repo(model_id, token=token, repo_type='model', exist_ok=True)
     print(repo_url)
     repo_id = "/".join(repo_url.split("/")[3:])
     print(repo_id)
@@ -230,3 +302,70 @@ def predict(repo_id, image_path):
     # De-normalize the prediction
     prediction = prediction.item() * max_value
     return prediction
+
+def evaluate_model(model, dataset_id, value_column_name):
+    dataset = load_dataset(dataset_id)
+
+    #subsample 10 examples
+    dataset['train'] = dataset['train'].select(range(10))
+
+
+    train_values = dataset['train'][value_column_name]
+    min_value = min(train_values)
+    max_value = max(train_values)
+    print('Min Value:', min_value)
+    print('Max Value:', max_value)
+
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
+
+    def preprocess(example):
+        example['image'] = transform(example['image'])
+        example[value_column_name] = example[value_column_name] / max_value  # Normalize values
+        return example
+
+    # Apply the preprocessing with normalization
+    dataset = dataset.map(preprocess, batched=False)
+
+
+    def collate_fn(batch):
+        # Ensure that each item['image'] is a tensor
+        pixel_values = torch.stack([torch.tensor(item['image']) for item in batch])
+        labels = torch.tensor([item[value_column_name] for item in batch], dtype=torch.float).unsqueeze(1)
+        return {'pixel_values': pixel_values, 'labels': labels}
+    
+    test_loader = DataLoader(dataset['train'], batch_size=8, shuffle=False, collate_fn=collate_fn)
+    
+    # # If not already downloaded, download model and metadata
+    # if(not os.path.exists('./model.safetensors')):
+    #     api = HfApi()
+    #     api.hf_hub_download(repo_id=repo_id, local_dir='.', filename="model.safetensors")
+    # if(not os.path.exists('./metadata.json')):
+    #     api = HfApi()
+    #     api.hf_hub_download(repo_id=repo_id, local_dir='.', filename="metadata.json")
+    
+    # model = ViTRegressionModel()
+
+    # # Load the saved model checkpoint
+    # checkpoint_path = "./model.safetensors"
+    # state_dict = safetensors_load_file(checkpoint_path)
+    # model.load_state_dict(state_dict)
+    model.eval()
+
+    mse = 0
+
+    for batch in tqdm(test_loader):
+        pixel_values = batch['pixel_values']
+        labels = batch['labels']
+        with torch.no_grad():
+            preds = model(pixel_values, labels)
+        preds = preds.item() * max_value
+        mse += ((preds - labels) ** 2).mean().item()
+    
+    mse /= len(test_loader)
+    return mse
+
+
+    
